@@ -1,9 +1,12 @@
 import csv
 import re
+import datetime
+import json
 from pathlib import Path
 from html import escape
 
 IMAGE_BASE = "https://si339.github.io/ClientData/21615274/"  # trailing slash matters
+DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/vannesschia/SI338/main/images/skyline_logo.jpg"  # optional hosted fallback image URL
 YEAR_FILTER = None  # set to "2025" if you only want one season; leave None for all races
 
 
@@ -75,28 +78,67 @@ def year_from_date(date_str: str) -> str:
 def image_url(photo_filename: str) -> str:
     fn = (photo_filename or "").strip()
     if not fn or fn.upper() == "N/A":
-        return ""
+        return DEFAULT_IMAGE_URL.strip() if DEFAULT_IMAGE_URL.strip() else ""
     return IMAGE_BASE + fn
-
 
 def image_alt_text(record: dict, fallback: str) -> str:
     """Prefer explicit AltText from the CSV; otherwise use a sensible fallback."""
     alt = (record.get("AltText") or "").strip()
     return alt if alt else fallback
 
+def parse_time_to_seconds(time_str: str):
+    """Parse common race time formats into seconds (float)."""
+    t = (time_str or "").strip()
+    if not t or t.upper() == "N/A":
+        return None
 
-def replace_cover_photo_alt(html_text: str, athlete_name: str) -> str:
-    """Updates the hero/cover photo alt text to include the athlete's name."""
-    name = (athlete_name or "").strip()
-    if not name:
-        return html_text
-    # Match: <img class="photo" ... alt="...">
-    return re.sub(
-        r'(<img\s+class="photo"[^>]*\salt=")([^"]*)(")',
-        lambda m: m.group(1) + escape(f"Portrait of {name}.") + m.group(3),
-        html_text,
-        count=1,
-    )
+    if t.count(":") == 2:
+        # H:MM:SS(.ms)
+        a, b, c = t.split(":")
+        try:
+            return int(a) * 3600 + int(b) * 60 + float(c)
+        except ValueError:
+            return None
+
+    if t.count(":") == 1:
+        # MM:SS(.ms)
+        a, b = t.split(":", 1)
+        try:
+            return int(a) * 60 + float(b)
+        except ValueError:
+            return None
+
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def build_race_series(records):
+    """Return [{date, meet, time, seconds}] sorted by date if parsable."""
+    points = []
+    for r in records:
+        if YEAR_FILTER is not None and year_from_date((r.get("Date") or "").strip()) != YEAR_FILTER:
+            continue
+
+        meet = safe(r.get("Meet Name"))
+        date = safe(r.get("Date"))
+        time = safe(r.get("Time"))
+        sec = parse_time_to_seconds(time)
+
+        sort_key = ""
+        ds = (r.get("Date") or "").strip()
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%b %d %Y", "%B %d %Y"):
+            try:
+                sort_key = datetime.datetime.strptime(ds, fmt).date().isoformat()
+                break
+            except Exception:
+                pass
+
+        points.append({"date": date, "meet": meet, "time": time, "seconds": sec, "_sort": sort_key})
+
+    points.sort(key=lambda p: (p["_sort"] == "", p["_sort"]))
+    return [{"date": p["date"], "meet": p["meet"], "time": p["time"], "seconds": p["seconds"]} for p in points]
 
 # ---------------------------
 # Build meet cards with toggle details
@@ -125,9 +167,8 @@ def build_meet_cards(records):
         details_id = f"race-details-{i}"
         title_id = f"meet-{i}-title"
 
-        img_alt = image_alt_text(r, fallback=f"Photo from {meet}.")
         img_html = (
-            f'<img src="{escape(img_src)}" width="200" alt="{escape(img_alt)}">'
+            f'<img src="{escape(img_src)}" alt="{image_alt_text(r, fallback=f"Photo from {meet}.")}" loading="lazy" decoding="async">'
             if img_src
             else '<p>No image available.</p>'
         )
@@ -187,13 +228,17 @@ def inject_cards_into_template(template_html: str, cards_html: str) -> str:
     return before + "\n" + cards_html + "\n" + panel_and_after
 
 
-def inject_toggle_script(html_text: str) -> str:
+def inject_scripts(html_text: str, race_series_json: str) -> str:
+    """Injects:
+      - race data JSON
+      - toggle behavior for dropdown details
+      - Chart.js time trend rendering (requires Chart.js + #time-chart in template)
     """
-    Adds a tiny script before </body> to toggle the hidden details div.
-    """
-    script = """
+    script = f"""
+<script id="race-data" type="application/json">{race_series_json}</script>
 <script>
-  document.addEventListener("click", function (e) {
+  // Toggle per-card details (layout-stable overlay)
+  document.addEventListener("click", function (e) {{
     const btn = e.target.closest("button.open-panel");
     if (!btn) return;
 
@@ -204,14 +249,83 @@ def inject_toggle_script(html_text: str) -> str:
     if (!panel) return;
 
     const isOpen = !panel.hasAttribute("hidden");
-    if (isOpen) {
+    if (isOpen) {{
       panel.setAttribute("hidden", "");
       btn.setAttribute("aria-expanded", "false");
-    } else {
+    }} else {{
       panel.removeAttribute("hidden");
       btn.setAttribute("aria-expanded", "true");
-    }
-  });
+    }}
+  }});
+
+  // Chart.js time trend
+  document.addEventListener("DOMContentLoaded", function () {{
+    const el = document.getElementById("race-data");
+    const canvas = document.getElementById("time-chart");
+    if (!el || !canvas || typeof Chart === "undefined") return;
+
+    const races = JSON.parse(el.textContent || "[]")
+      .filter(r => typeof r.seconds === "number" && !Number.isNaN(r.seconds));
+
+    if (!races.length) return;
+
+    const labels = races.map(r => r.date);
+    const seconds = races.map(r => r.seconds);
+
+    function formatTime(sec) {{
+      const m = Math.floor(sec / 60);
+      const s = sec - m * 60;
+      const sInt = Math.floor(s);
+      const tenths = Math.round((s - sInt) * 10);
+      const ss = String(sInt).padStart(2, "0");
+      return tenths > 0 ? `${{m}}:${{ss}}.${{tenths}}` : `${{m}}:${{ss}}`;
+    }}
+
+    const ctx = canvas.getContext("2d");
+    new Chart(ctx, {{
+      type: "line",
+      data: {{
+        labels,
+        datasets: [{{
+          label: "Race time",
+          data: seconds,
+          tension: 0.25,
+          pointRadius: 3
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {{
+          tooltip: {{
+            callbacks: {{
+              title: (items) => {{
+                const i = items?.[0]?.dataIndex ?? 0;
+                return races[i]?.meet ? `${{races[i].meet}}` : `${{labels[i]}}`;
+              }},
+              label: (item) => `Time: ${{formatTime(item.parsed.y)}}`,
+              afterLabel: (item) => {{
+                const i = item.dataIndex;
+                return races[i]?.date ? `Date: ${{races[i].date}}` : "";
+              }}
+            }}
+          }}
+        }},
+        scales: {{
+          y: {{
+            reverse: true,
+            ticks: {{
+              callback: (value) => formatTime(value)
+            }},
+            title: {{ display: true, text: "Time (mm:ss)" }}
+          }},
+          x: {{
+            title: {{ display: true, text: "Meet date" }}
+          }}
+        }}
+      }}
+    }});
+  }});
 </script>
 """
     if "</body>" not in html_text:
@@ -256,10 +370,13 @@ def main():
     # Update name in header (optional, but usually desired)
     athlete_name = (bio.get("Athlete Name") or "").strip()
     out_html = replace_first_h1(out_html, athlete_name)
-    out_html = replace_cover_photo_alt(out_html, athlete_name)
 
-    # Add toggle script for the "More info" buttons
-    out_html = inject_toggle_script(out_html)
+    # Build race series JSON for Chart.js
+    race_series = build_race_series(results)
+    race_series_json = json.dumps(race_series)
+
+    # Add scripts (toggle + chart)
+    out_html = inject_scripts(out_html, race_series_json)
 
     out_path.write_text(out_html, encoding="utf-8")
     print(f"Wrote {out_path.name}")
