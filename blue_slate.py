@@ -168,29 +168,29 @@ def build_meet_cards(records):
         title_id = f"meet-{i}-title"
 
         img_html = (
-            f'<img src="{escape(img_src)}" alt="{image_alt_text(r, fallback=f"Photo from {meet}.")}" loading="lazy" decoding="async">'
+            f'''<img src="{escape(img_src)}" onerror = "this.src ='images/skyline_logo.png'" alt="{image_alt_text(r, fallback=f"Photo from {meet}.")}" loading="lazy" decoding="async">'''
             if img_src
             else '<p>No image available.</p>'
         )
 
         cards.append(f"""
-        <article class="meet-card" aria-labelledby="{title_id}">
+        <article class="meet-card">
           <h3 id="{title_id}">{escape(meet)}</h3>
 
           <div class="spacer">
             {img_html}
           </div>
 
-          <button type="button" class="open-panel" aria-expanded="false" aria-controls="{details_id}">
-            More info
-          </button>
+         <details>
+            <summary>More info</summary>
 
-          <div id="{details_id}" class="race-details" hidden>
+          <div id="{details_id}" class="race-details">
             <p><strong>Date:</strong> {escape(date)}</p>
             <p><strong>Time:</strong> {escape(time)}</p>
             <p><strong>Grade:</strong> {escape(grade)}</p>
             <p><strong>Overall place:</strong> {escape(place)}</p>
           </div>
+          </details>
         </article>
 """)
 
